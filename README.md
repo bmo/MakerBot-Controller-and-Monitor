@@ -1,3 +1,12 @@
+# MakerBot-Controller-and-Monitor
+Forked from [Thunderdigital/MakerBot-Controller-and-Monitor](https://github.com/Thunderdigital/MakerBot-Controller-and-Monitor)
+
+This is a python script that talks to a networked Makerbot Z18. Changes made to 
+suit my UI preferences and use on a Mac.
+
+
+Original README:
+---
 I wanted to replace the factory makerbot desktop and makerbot print control programs.
 The script is constantly evolving. Use only at your own risk.
 
