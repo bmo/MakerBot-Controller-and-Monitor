@@ -9,15 +9,24 @@ import zlib
 import select 
 import struct
 import configparser
-import winsound
+import concurrent.futures
 from typing import Dict, Any, Optional, Tuple, Union, List
+
+try:
+    from zeroconf import ServiceBrowser, Zeroconf, ServiceStateChange
+    HAS_ZEROCONF = True
+except ImportError:
+    HAS_ZEROCONF = False
 
 try:
     # msvcrt (Microsoft Visual C Runtime) only on Windows.
     import msvcrt
+    import winsound
     IS_WINDOWS = True
 except ImportError:
     IS_WINDOWS = False
+    import termios
+    import tty
 
 # --- CONTANTS ---
 PRINTER_PORT_SECURE = 12309
@@ -178,8 +187,9 @@ class ListenerThread(threading.Thread):
                 current_process_name = current_process_data.get("name", "Active process")
                 current_step = current_process_data.get("step", "N/A")                
                 if current_step == "completed": 
-                    winsound.Beep(784, 600)
-                    winsound.Beep(880, 600)
+                    if IS_WINDOWS:
+                        winsound.Beep(784, 600)
+                        winsound.Beep(880, 600)
                 
                 filename = current_process_data.get("filename") 
                 if filename:
@@ -258,16 +268,24 @@ def rpc_call_raw(raw_json_string: str) -> Tuple[Optional[str], Optional[str]]:
 #           RPC FILE UPLOAD LOGIC
 # ==============================================================================
 
-def rpc_file_upload() -> Tuple[Optional[str], Optional[str]]:
+def rpc_file_upload(upload_file_path=None) -> Tuple[Optional[str], Optional[str]]:
     global ssl_socket, global_request, filename
+    
+    if upload_file_path is None:
+        upload_file_path = LOCAL_FILE_PATH
+
     rpc_call_raw('{"params": {}, "jsonrpc": "2.0", "method": "clear_queue"}')
     time.sleep(0.1)
     rpc_call_raw('{"params": {}, "jsonrpc": "2.0", "method": "close_queue"}')
     time.sleep(0.1)
-    absolute_local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), LOCAL_FILE_PATH)
+    
+    if os.path.isabs(upload_file_path):
+        absolute_local_path = upload_file_path
+    else:
+        absolute_local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), upload_file_path)
     
     if not os.path.exists(absolute_local_path):
-        return "rpc_file_upload", f"ERROR: Local file not found: {LOCAL_FILE_PATH}"
+        return "rpc_file_upload", f"ERROR: Local file not found: {absolute_local_path}"
     try:
         with open(absolute_local_path, 'rb') as f:
             file_bytes = f.read()
@@ -278,11 +296,14 @@ def rpc_file_upload() -> Tuple[Optional[str], Optional[str]]:
 
     feedback_prefix = f"Upload ({os.path.basename(absolute_local_path)}, {file_size} byte)"
 
+    printer_file_name = os.path.basename(absolute_local_path)
+    current_rpc_file_path = f"//current_thing/{printer_file_name}"
+
     # --- 1. STEP: put_init    
     init_params = {
         "length": file_size, 
         "block_size": RPC_BLOCK_SIZE, 
-        "file_path": RPC_FILE_PATH,
+        "file_path": current_rpc_file_path,
         "file_id": RPC_FILE_ID
     }
     call = {
@@ -343,7 +364,7 @@ def rpc_file_upload() -> Tuple[Optional[str], Optional[str]]:
     global_request += 1
     
     print_params = {
-        "filepath": LOCAL_FILE_PATH,
+        "filepath": printer_file_name,
         "ensure_build_plate_clear": False
     } 
     
@@ -530,7 +551,13 @@ def z_zero():
         return "There is something wrong with my MOVE commands.", str(e)
 
 def action_menu_0():
-    return rpc_file_upload()
+    try:
+        user_file = input(f"\nEnter the filename to upload and print (or press Enter for default '{LOCAL_FILE_PATH}'): ").strip()
+        if not user_file:
+            user_file = LOCAL_FILE_PATH
+        return rpc_file_upload(user_file)
+    except EOFError:
+        return None, "Upload cancelled."
     
 def action_menu_1():
     return rpc_call_raw(JSON_menu_1)
@@ -604,6 +631,59 @@ def action_menu_N():
 def action_menu_P():
     return print_rpc()
 
+def scan_lan_for_printers_zeroconf() -> List[str]:
+    if not HAS_ZEROCONF:
+        return []
+    found_printers = []
+    
+    def on_service_state_change(zeroconf, service_type, name, state_change):
+        if state_change is ServiceStateChange.Added:
+            info = zeroconf.get_service_info(service_type, name)
+            if info and info.parsed_addresses():
+                found_printers.append(info.parsed_addresses()[0])
+
+    zc = Zeroconf()
+    browser = ServiceBrowser(zc, "_makerbot-jsonrpc._tcp.local.", handlers=[on_service_state_change])
+    time.sleep(3)
+    zc.close()
+    return sorted(list(set(found_printers)))
+
+def action_menu_S():
+    clear_screen()
+    print("Starting TCP Port 12309 scan... This may take a few seconds.")
+    found = scan_lan_for_printers(12309)
+    print("\nScan complete.")
+    if found:
+        print("Found printers at:")
+        for ip in found:
+            print(f"  - {ip}")
+    else:
+        print("No printers found.")
+    try:
+        input("\nPress Enter to return to monitor...")
+    except EOFError:
+        pass
+    return None, None
+
+def action_menu_Z():
+    if not HAS_ZEROCONF:
+        return None, f"Zeroconf library not installed in the current environment. Run '{sys.executable} -m pip install zeroconf' to install it."
+    clear_screen()
+    print("Starting Zeroconf/mDNS scan... Listening for 3 seconds.")
+    found = scan_lan_for_printers_zeroconf()
+    print("\nScan complete.")
+    if found:
+        print("Found printers at:")
+        for ip in found:
+            print(f"  - {ip}")
+    else:
+        print("No printers found.")
+    try:
+        input("\nPress Enter to return to monitor...")
+    except EOFError:
+        pass
+    return None, None
+
 def action_menu_x():
     return rpc_call_raw(JSON_menu_x)  
 
@@ -665,6 +745,9 @@ def display_monitor(status: Dict[str, Any], feedback: str):
     print(f" E/F/G/H/I - Move to Z UP 0.01mm/0.1mm/1.0mm/10mm/100mm")
     print(f" J/K/L/M/N - Move to Z DOWN 0.01mm/0.1mm/1.0mm/10mm/100mm")
     print("-" * 50)
+    print(f" S - Scan LAN for Printers (TCP Port 12309)")
+    print(f" Z - Scan LAN for Printers (Zeroconf / mDNS)")
+    print("-" * 50)
     print(f" ENTER  - OK - print ready")
     print(f" SPACE  - Pause / Resume")
     print(f" CTRL+x - Cancel")
@@ -687,6 +770,41 @@ def display_monitor(status: Dict[str, Any], feedback: str):
     # -------------------------------
     pass
 
+def check_port(ip: str, port: int, timeout: float = 0.1) -> Optional[str]:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((ip, port))
+            return ip
+    except Exception:
+        return None
+
+def scan_lan_for_printers(port: int) -> List[str]:
+    print(f"Scanning the local network for MakerBot printers on port {port} (this takes a few seconds)...")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    
+    if IP == '127.0.0.1':
+        return []
+    
+    prefix = '.'.join(IP.split('.')[:-1]) + '.'
+    ips_to_scan = [prefix + str(i) for i in range(1, 255)]
+    found = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        future_to_ip = {executor.submit(check_port, ip, port): ip for ip in ips_to_scan}
+        for future in concurrent.futures.as_completed(future_to_ip):
+            res = future.result()
+            if res:
+                found.append(res)
+    return sorted(found)
+
 def get_config():
     config = configparser.ConfigParser()
     cfg_filename = 'makerbot.cfg'
@@ -697,10 +815,22 @@ def get_config():
         FIRSTRUN=True
         print()
         print(f"The {cfg_filename} not found.")
-        print(f"Pase enter the following settings:")
+        print("Please enter the following settings:")
         print()
-        ip = input("3D Printer IP address:")
-        user = input("Username: ")
+        
+        found_printers = scan_lan_for_printers(PRINTER_PORT_SECURE)
+        if found_printers:
+            print("\nFound MakerBot printers at the following IP addresses:")
+            for idx, p_ip in enumerate(found_printers):
+                print(f"  {idx + 1}. {p_ip}")
+            ip = input(f"\n3D Printer IP address (or press Enter to use {found_printers[0]}): ").strip()
+            if not ip:
+                ip = found_printers[0]
+        else:
+            print("\nNo MakerBot printers found on the local network automatically.")
+            ip = input("3D Printer IP address: ").strip()
+
+        user = input("Username: ").strip()
         code = LOCAL_CODE
 
         config['SETTINGS'] = {
@@ -892,9 +1022,15 @@ def main():
         'L': action_menu_L,
         'M': action_menu_M,
         'N': action_menu_N,
+        
+        'S': action_menu_S,
+        's': action_menu_S,
+        'Z': action_menu_Z,
+        'z': action_menu_Z,
 
         '\x18': action_menu_x,
         '\r': action_menu_enter,
+        '\n': action_menu_enter,
         ' ': action_menu_space,
     }
     
@@ -927,20 +1063,39 @@ def main():
                     time.sleep(time_to_wait)
                         
             else:
-                try:
-                    i, o, e = select.select([sys.stdin], [], [], timeout_seconds)
-                except select.error:
-                    continue 
-                except ValueError:
-                    is_running.clear()
-                    break
-                    
-                if i:
+                if sys.stdin.isatty():
+                    fd = sys.stdin.fileno()
+                    old_settings = termios.tcgetattr(fd)
                     try:
-                        user_input = sys.stdin.readline().strip()
-                    except EOFError:
+                        tty.setcbreak(fd)
+                        i, o, e = select.select([sys.stdin], [], [], timeout_seconds)
+                        if i:
+                            user_input = sys.stdin.read(1)
+                            if user_input == '':
+                                is_running.clear()
+                                break
+                    except select.error:
+                        continue 
+                    except ValueError:
                         is_running.clear()
                         break
+                    finally:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                else:
+                    try:
+                        i, o, e = select.select([sys.stdin], [], [], timeout_seconds)
+                    except select.error:
+                        continue 
+                    except ValueError:
+                        is_running.clear()
+                        break
+                        
+                    if i:
+                        try:
+                            user_input = sys.stdin.readline().strip()
+                        except EOFError:
+                            is_running.clear()
+                            break
 
             if user_input:
                 if user_input == '\x1b':
@@ -955,7 +1110,10 @@ def main():
                     method_name, error_message = menu_actions[user_input]()
                     
                     if error_message:
-                        new_feedback = f"ERROR: RPC send failed. {error_message}"
+                        if user_input.upper() in ['S', 'Z']:
+                            new_feedback = f"ERROR: {error_message}"
+                        else:
+                            new_feedback = f"ERROR: RPC send failed. {error_message}"
                         action_sleep_time = 2.0
                     elif method_name:
                         new_feedback = f"SUCCESS: The following command was sent to the printer: ({method_name})"
